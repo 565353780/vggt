@@ -34,26 +34,24 @@ def _get_num_images(images: Tensor) -> int:
 def filter_valid_indices(
     images: Tensor,
     model: VGGT,
-    attn_weight: float = 0.5,
-    cos_weight: float = 0.5,
-    reject_thresh: float = 0.4,
+    cos_thresh: float = 0.5,
     target_layer: int = 23,
 ) -> Tuple[List[int], Dict]:
     """
-    基于注意力和余弦相似度筛选有效帧索引。
+    基于帧间余弦相似度的图连通性筛选有效帧索引。
     
     核心逻辑：
-    1. 计算每帧与参考帧（第一帧）的特征余弦相似度
-    2. 计算每帧在参考帧注意力图中的平均权重
-    3. 综合两个指标，筛选出有效帧
+    1. 计算任意两帧之间的特征余弦相似度矩阵 (N x N)
+    2. 找出相似度最高的两帧作为初始有效视角集合
+    3. 依次检查其他帧，如果该帧与有效视角集合中任意一帧的相似度 >= 阈值，
+       则将其加入有效视角集合
+    4. 重复步骤3直到没有新的帧可以加入
     
     Args:
         images: 输入图像张量，形状为 (N, C, H, W) 或 (B, N, C, H, W)
         model: VGGT 模型实例
-        attn_weight: 注意力权重系数
-        cos_weight: 余弦相似度权重系数
-        reject_thresh: 拒绝阈值，低于此值的帧将被过滤
-        target_layer: 用于计算的 transformer 层索引
+        cos_thresh: 余弦相似度阈值，用于判断帧是否有效
+        target_layer: 用于计算特征的 transformer 层索引
         
     Returns:
         valid_indices: 有效帧的索引列表
@@ -66,39 +64,26 @@ def filter_valid_indices(
     if num_images <= 1:
         return list(range(num_images)), {}
     
+    if num_images == 2:
+        # 只有两帧时，直接返回两帧
+        return [0, 1], {}
+    
     # 准备输入
     images_device = images.to(device=device, dtype=dtype)
     
     # 获取模型参数
     aggregator = model.aggregator
-    patch_size = aggregator.patch_size
     patch_start_idx = aggregator.patch_start_idx
-    H, W = images.shape[-2:]
-    h_patches = H // patch_size
-    w_patches = W // patch_size
-    num_patch_tokens = h_patches * w_patches
-    tokens_per_image = patch_start_idx + num_patch_tokens
     
-    # 设置 hooks 获取注意力权重和 aggregated_tokens
-    q_out: Dict[int, Tensor] = {}
-    k_out: Dict[int, Tensor] = {}
+    # 设置 hooks 获取 aggregated_tokens
     aggregated_tokens_out: Dict[int, Tensor] = {}
     handles = []
-    
-    def _make_hook(store_dict: dict, layer_idx: int):
-        def _hook(_module, _inp, out):
-            store_dict[layer_idx] = out.detach()
-        return _hook
     
     def _make_block_hook(store_dict: dict, layer_idx: int):
         """Hook for capturing block output (aggregated tokens)."""
         def _hook(_module, _inp, out):
             store_dict[layer_idx] = out.detach()
         return _hook
-    
-    blk = model.aggregator.global_blocks[target_layer].attn
-    handles.append(blk.q_norm.register_forward_hook(_make_hook(q_out, target_layer)))
-    handles.append(blk.k_norm.register_forward_hook(_make_hook(k_out, target_layer)))
     
     # 添加 hook 来获取 global_blocks 的输出（aggregated tokens）
     handles.append(model.aggregator.global_blocks[target_layer].register_forward_hook(
@@ -117,7 +102,7 @@ def filter_valid_indices(
     for h in handles:
         h.remove()
     
-    # ========== 计算余弦相似度 ==========
+    # ========== 计算帧间余弦相似度矩阵 ==========
     # 从 hook 获取 global block 的输出（即 global tokens）
     if target_layer not in aggregated_tokens_out:
         print(f"Warning: aggregated_tokens not captured for layer {target_layer}")
@@ -145,76 +130,80 @@ def filter_valid_indices(
         # 已经是 (B, S, P, C) 格式
         global_tokens = global_block_output
     
-    cos_sim_mean: Optional[Tensor] = None
+    # 计算帧间余弦相似度矩阵
+    cos_sim_matrix: Optional[Tensor] = None
     if global_tokens.ndim == 4:
         B, N, T, C = global_tokens.shape
         if T > 0 and C > 0:
-            feature = global_tokens[:, :, patch_start_idx:, :].detach().float()
-            B, N, T, C = feature.shape
-            layer_feat = feature.reshape(B * N, T, C)
+            # 提取 patch tokens 的特征
+            feature = global_tokens[:, :, patch_start_idx:, :].detach().float()  # (B, N, T', C)
+            B, N, T_prime, C = feature.shape
             
-            ref_feat = layer_feat[0:1]  # 参考帧特征
-            ref_feat_norm = F.normalize(ref_feat, p=2, dim=-1)
-            layer_feat_norm = F.normalize(layer_feat, p=2, dim=-1)
+            # 计算每帧的平均特征向量
+            frame_features = feature.mean(dim=2)  # (B, N, C)
+            frame_features = frame_features.squeeze(0)  # (N, C)
             
-            cos_sim = torch.einsum("bic,bjc->bij", layer_feat_norm, ref_feat_norm)
-            cos_sim_mean = cos_sim.mean(-1).mean(-1)  # (N,)
+            # 归一化
+            frame_features_norm = F.normalize(frame_features, p=2, dim=-1)  # (N, C)
+            
+            # 计算帧间余弦相似度矩阵 (N x N)
+            cos_sim_matrix = torch.mm(frame_features_norm, frame_features_norm.t())  # (N, N)
     
-    # ========== 计算注意力均值 ==========
-    attn_mean_vals: List[float] = []
-    
-    if target_layer in q_out and target_layer in k_out:
-        Q = q_out[target_layer]
-        K = k_out[target_layer]
-        
-        T_k = int(K.shape[-2])
-        num_images_in_seq = T_k // tokens_per_image
-        
-        if num_images_in_seq > 0:
-            # 第一帧的 query
-            q_first = Q[:, :, patch_start_idx:patch_start_idx + num_patch_tokens, :]
-            # 所有帧的 key
-            T_k_slice = min(num_images, num_images_in_seq) * tokens_per_image
-            K_slice = K[:, :, :T_k_slice, :]
-            
-            scale = 1.0 / math.sqrt(float(q_first.shape[-1]))
-            logits = torch.einsum("bhqd,bhtd->bhqt", q_first, K_slice) * scale
-            probs = torch.softmax(logits, dim=-1)
-            attn_first = probs.mean(dim=1).mean(dim=1)[0]  # (T_k_slice,)
-            
-            # 计算每帧的注意力均值
-            for img_idx in range(num_images):
-                start = img_idx * tokens_per_image + patch_start_idx
-                end = start + num_patch_tokens
-                if start >= attn_first.shape[-1]:
-                    break
-                end = min(end, attn_first.shape[-1])
-                
-                patch_attn = attn_first[start:end]
-                if patch_attn.numel() == num_patch_tokens:
-                    attn_mean_vals.append(float(patch_attn.mean().item()))
-    
-    # ========== 综合评分并筛选 ==========
+    # ========== 基于图连通性筛选有效帧 ==========
     valid_indices = list(range(num_images))
     
-    if attn_mean_vals and cos_sim_mean is not None and len(attn_mean_vals) == num_images:
-        attn_tensor = torch.tensor(attn_mean_vals, device=cos_sim_mean.device, dtype=cos_sim_mean.dtype)
+    if cos_sim_matrix is not None:
+        N = cos_sim_matrix.shape[0]
         
-        # 归一化
-        cos_norm = (cos_sim_mean - cos_sim_mean.min()) / (cos_sim_mean.max() - cos_sim_mean.min() + 1e-6)
-        attn_norm = (attn_tensor - attn_tensor.min()) / (attn_tensor.max() - attn_tensor.min() + 1e-6)
+        # 找出相似度最高的两帧（排除对角线）
+        # 将对角线设为 -1，避免选择同一帧
+        sim_matrix_no_diag = cos_sim_matrix.clone()
+        sim_matrix_no_diag.fill_diagonal_(-1)
         
-        # 综合评分
-        combined_score = attn_weight * attn_norm + cos_weight * cos_norm
+        # 找到最大相似度的位置
+        max_sim_flat_idx = sim_matrix_no_diag.argmax().item()
+        max_i = max_sim_flat_idx // N
+        max_j = max_sim_flat_idx % N
         
-        # 筛选（第一帧永不拒绝）
-        valid_indices = [0]
-        for idx in range(1, num_images):
-            if combined_score[idx] >= reject_thresh:
-                valid_indices.append(idx)
+        max_sim_value = cos_sim_matrix[max_i, max_j].item()
+        print(f"Maximum pairwise similarity: {max_sim_value:.4f} between frames {max_i} and {max_j}")
+        
+        # 初始化有效视角集合：相似度最高的两帧
+        valid_set = {max_i, max_j}
+        remaining = set(range(N)) - valid_set
+        
+        # 迭代扩展有效视角集合
+        changed = True
+        while changed and remaining:
+            changed = False
+            to_add = set()
+            
+            for idx in remaining:
+                # 检查该帧与有效集合中任意一帧的相似度是否 >= 阈值
+                max_sim_to_valid = max(cos_sim_matrix[idx, v].item() for v in valid_set)
+                if max_sim_to_valid >= cos_thresh:
+                    to_add.add(idx)
+                    changed = True
+            
+            valid_set.update(to_add)
+            remaining -= to_add
+        
+        valid_indices = sorted(list(valid_set))
+        
+        print(f"Similarity threshold: {cos_thresh}")
+        print(f"Valid frames: {valid_indices} ({len(valid_indices)}/{N})")
+        print(f"Rejected frames: {sorted(list(remaining))}")
+        
+        # 打印相似度矩阵（调试用）
+        if N <= 10:
+            print("Cosine similarity matrix:")
+            for i in range(N):
+                row_str = " ".join([f"{cos_sim_matrix[i, j].item():.3f}" for j in range(N)])
+                marker = " *" if i in valid_set else ""
+                print(f"  Frame {i}: [{row_str}]{marker}")
     
     # 清理
-    del q_out, k_out, aggregated_tokens_out
+    del aggregated_tokens_out
     _safe_empty_cache()
     
     # 转换 predictions 到 CPU

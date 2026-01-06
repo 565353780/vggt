@@ -44,7 +44,7 @@ model = model.to(device)
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
-def run_model(target_dir, model, robust_mode=False) -> dict:
+def run_model(target_dir, model, robust_mode=False, cos_thresh=0.5) -> dict:
     """
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
     
@@ -52,6 +52,7 @@ def run_model(target_dir, model, robust_mode=False) -> dict:
         target_dir: 图像目录
         model: VGGT 模型
         robust_mode: 是否启用 robust 模式，筛选有效帧
+        cos_thresh: robust 模式下的余弦相似度阈值
     """
     print(f"Processing images from {target_dir}")
 
@@ -84,14 +85,51 @@ def run_model(target_dir, model, robust_mode=False) -> dict:
     num_total_images = images.shape[0]
     
     if robust_mode and num_total_images > 1:
-        print("Running robust mode filtering...")
-        valid_indices, _ = filter_valid_indices(images, model)
+        print(f"Running robust mode filtering (cos_thresh={cos_thresh})...")
+        valid_indices, filter_predictions = filter_valid_indices(images, model, cos_thresh=cos_thresh)
         all_indices = set(range(num_total_images))
         rejected_indices = sorted(list(all_indices - set(valid_indices)))
         print(f"Robust mode: {len(valid_indices)} valid frames, {len(rejected_indices)} rejected frames")
         print(f"Rejected frame indices: {rejected_indices}")
         
-        if len(rejected_indices) > 0 and len(valid_indices) > 1:
+        # 如果没有被剔除的帧，直接使用 filter_valid_indices 返回的 predictions，不再重复推理
+        if len(rejected_indices) == 0:
+            print("No frames rejected, using predictions from filter pass (no second inference needed)...")
+            predictions = filter_predictions
+            
+            # Convert pose encoding to extrinsic and intrinsic matrices
+            print("Converting pose encoding to extrinsic and intrinsic matrices...")
+            # filter_predictions 中的 tensor 已经在 CPU 上
+            pose_enc = predictions["pose_enc"]
+            if isinstance(pose_enc, torch.Tensor):
+                pose_enc = pose_enc.to(device)
+            else:
+                pose_enc = torch.from_numpy(pose_enc).to(device)
+            
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            predictions["extrinsic"] = extrinsic
+            predictions["intrinsic"] = intrinsic
+            
+            # Convert tensors to numpy
+            for key in predictions.keys():
+                if isinstance(predictions[key], torch.Tensor):
+                    predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+            predictions['pose_enc_list'] = None
+            
+            # Generate world points from depth map
+            print("Computing world points from depth map...")
+            depth_map = predictions["depth"]
+            world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
+            predictions["world_points_from_depth"] = world_points
+            
+            # 存储帧索引
+            predictions["rejected_indices"] = np.array([], dtype=np.int64)
+            predictions["valid_indices"] = np.array(list(range(num_total_images)), dtype=np.int64)
+            
+            torch.cuda.empty_cache()
+            return predictions
+        
+        elif len(valid_indices) > 1:
             # 先用所有帧推理一次，获取被剔除帧的位姿
             print("First pass: getting poses for all frames...")
             with torch.no_grad():
@@ -315,12 +353,14 @@ def gradio_demo(
     mask_sky=False,
     prediction_mode="Pointmap Regression",
     robust_mode=False,
+    cos_thresh=0.5,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
     
     Args:
         robust_mode: 是否启用 robust vggt 模式，被剔除的帧以红色显示
+        cos_thresh: robust 模式下的余弦相似度阈值
     """
     if not os.path.isdir(target_dir) or target_dir == "None":
         return None, "No valid target directory found. Please upload first.", None, None
@@ -337,7 +377,7 @@ def gradio_demo(
 
     print("Running run_model...")
     with torch.no_grad():
-        predictions = run_model(target_dir, model, robust_mode=robust_mode)
+        predictions = run_model(target_dir, model, robust_mode=robust_mode, cos_thresh=cos_thresh)
 
     # Save predictions
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
@@ -398,11 +438,13 @@ def update_log():
 
 
 def update_visualization(
-    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example, robust_mode=False
+    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example, robust_mode=False, cos_thresh=0.5
 ):
     """
     Reload saved predictions from npz, create (or reuse) the GLB for new parameters,
     and return it for the 3D viewer. If is_example == "True", skip.
+    
+    Note: cos_thresh 在这里不使用，它只在推理阶段起作用。但需要在函数签名中接收以匹配输入。
     """
 
     # If it's an example click, skip as requested
@@ -614,24 +656,26 @@ with gr.Blocks(
                 )
 
             with gr.Row():
-                conf_thres = gr.Slider(minimum=0, maximum=100, value=50, step=0.1, label="Confidence Threshold (%)")
+                conf_thres = gr.Slider(minimum=0, maximum=100, value=80, step=0.1, label="Confidence Threshold (%)")
                 frame_filter = gr.Dropdown(choices=["All"], value="All", label="Show Points from Frame")
                 with gr.Column():
                     show_cam = gr.Checkbox(label="Show Camera", value=True)
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
-                    robust_mode = gr.Checkbox(label="Robust VGGT Mode (红色显示被剔除的帧)", value=False)
+                    robust_mode = gr.Checkbox(label="Robust VGGT Mode (过滤无关帧并二次推理)", value=False)
+                    cos_thresh = gr.Slider(minimum=0, maximum=1, value=0.5, step=0.01, 
+                                           label="Robust Mode: 余弦相似度阈值", visible=True)
 
     # ---------------------- Examples section ----------------------
     examples = [
-        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
-        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
-        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
-        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", False, "True"],
-        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
-        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
-        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
+        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", False, 0.5, "True"],
+        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", False, 0.5, "True"],
+        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", False, 0.5, "True"],
+        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", False, 0.5, "True"],
+        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", False, 0.5, "True"],
+        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", False, 0.5, "True"],
+        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", False, 0.5, "True"],
     ]
 
     def example_pipeline(
@@ -645,6 +689,7 @@ with gr.Blocks(
         mask_sky,
         prediction_mode,
         robust_mode_val,
+        cos_thresh_val,
         is_example_str,
     ):
         """
@@ -657,7 +702,8 @@ with gr.Blocks(
         # Always use "All" for frame_filter in examples
         frame_filter = "All"
         glbfile, log_msg, dropdown = gradio_demo(
-            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, robust_mode=robust_mode_val
+            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, 
+            robust_mode=robust_mode_val, cos_thresh=cos_thresh_val
         )
         return glbfile, log_msg, target_dir, dropdown, image_paths
 
@@ -676,6 +722,7 @@ with gr.Blocks(
             mask_sky,
             prediction_mode,
             robust_mode,
+            cos_thresh,
             is_example,
         ],
         outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
@@ -705,6 +752,7 @@ with gr.Blocks(
             mask_sky,
             prediction_mode,
             robust_mode,
+            cos_thresh,
         ],
         outputs=[reconstruction_output, log_output, frame_filter],
     ).then(
@@ -725,6 +773,7 @@ with gr.Blocks(
         prediction_mode,
         is_example,
         robust_mode,
+        cos_thresh,
     ]
     visualization_outputs = [reconstruction_output, log_output]
 
@@ -736,6 +785,7 @@ with gr.Blocks(
     mask_sky.change(update_visualization, visualization_inputs, visualization_outputs)
     prediction_mode.change(update_visualization, visualization_inputs, visualization_outputs)
     robust_mode.change(update_visualization, visualization_inputs, visualization_outputs)
+    cos_thresh.change(update_visualization, visualization_inputs, visualization_outputs)
 
     # -------------------------------------------------------------------------
     # Auto-update gallery whenever user uploads or changes their files
