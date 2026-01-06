@@ -149,57 +149,102 @@ def filter_valid_indices(
             # 计算帧间余弦相似度矩阵 (N x N)
             cos_sim_matrix = torch.mm(frame_features_norm, frame_features_norm.t())  # (N, N)
     
-    # ========== 基于图连通性筛选有效帧 ==========
+    # ========== 基于聚类的有效帧筛选 ==========
     valid_indices = list(range(num_images))
     
     if cos_sim_matrix is not None:
         N = cos_sim_matrix.shape[0]
         
-        # 找出相似度最高的两帧（排除对角线）
-        # 将对角线设为 -1，避免选择同一帧
+        # 创建一个不包含对角线的相似度矩阵副本（用于查找最大值）
         sim_matrix_no_diag = cos_sim_matrix.clone()
         sim_matrix_no_diag.fill_diagonal_(-1)
         
-        # 找到最大相似度的位置
-        max_sim_flat_idx = sim_matrix_no_diag.argmax().item()
-        max_i = max_sim_flat_idx // N
-        max_j = max_sim_flat_idx % N
+        # 聚类：将所有帧分成多个连通的集合
+        remaining = set(range(N))
+        clusters = []  # 存储所有聚类结果
         
-        max_sim_value = cos_sim_matrix[max_i, max_j].item()
-        print(f"Maximum pairwise similarity: {max_sim_value:.4f} between frames {max_i} and {max_j}")
-        
-        # 初始化有效视角集合：相似度最高的两帧
-        valid_set = {max_i, max_j}
-        remaining = set(range(N)) - valid_set
-        
-        # 迭代扩展有效视角集合
-        changed = True
-        while changed and remaining:
-            changed = False
-            to_add = set()
+        while remaining:
+            # 在剩余帧中找出相似度最高的两帧作为新集合的种子
+            # 创建一个只包含剩余帧的子矩阵掩码
+            remaining_list = sorted(list(remaining))
             
-            for idx in remaining:
-                # 检查该帧与有效集合中任意一帧的相似度是否 >= 阈值
-                max_sim_to_valid = max(cos_sim_matrix[idx, v].item() for v in valid_set)
-                if max_sim_to_valid >= cos_thresh:
-                    to_add.add(idx)
-                    changed = True
+            if len(remaining) == 1:
+                # 只剩一帧，单独作为一个集合
+                clusters.append(remaining.copy())
+                remaining.clear()
+                break
             
-            valid_set.update(to_add)
-            remaining -= to_add
+            # 在剩余帧中找相似度最高的一对
+            max_sim = -1
+            best_i, best_j = remaining_list[0], remaining_list[1]
+            for i in remaining_list:
+                for j in remaining_list:
+                    if i != j:
+                        sim = cos_sim_matrix[i, j].item()
+                        if sim > max_sim:
+                            max_sim = sim
+                            best_i, best_j = i, j
+            
+            # 初始化当前集合
+            current_cluster = {best_i, best_j}
+            remaining -= current_cluster
+            
+            print(f"Starting new cluster with frames {best_i} and {best_j} (similarity: {max_sim:.4f})")
+            
+            # 迭代扩展当前集合
+            changed = True
+            while changed and remaining:
+                changed = False
+                to_add = set()
+                
+                for idx in remaining:
+                    # 检查该帧与当前集合中任意一帧的相似度是否 >= 阈值
+                    max_sim_to_cluster = max(cos_sim_matrix[idx, v].item() for v in current_cluster)
+                    if max_sim_to_cluster >= cos_thresh:
+                        to_add.add(idx)
+                        changed = True
+                
+                current_cluster.update(to_add)
+                remaining -= to_add
+            
+            clusters.append(current_cluster)
+            print(f"  Cluster {len(clusters)}: {sorted(list(current_cluster))} ({len(current_cluster)} frames)")
         
-        valid_indices = sorted(list(valid_set))
+        # 选择包含帧数最多的集合作为有效集合
+        largest_cluster = max(clusters, key=len)
+        valid_indices = sorted(list(largest_cluster))
         
-        print(f"Similarity threshold: {cos_thresh}")
+        # 计算被剔除的帧
+        all_frames = set(range(N))
+        rejected_set = all_frames - largest_cluster
+        
+        print(f"\nSimilarity threshold: {cos_thresh}")
+        print(f"Total clusters found: {len(clusters)}")
+        for i, cluster in enumerate(clusters):
+            marker = " (selected)" if cluster == largest_cluster else ""
+            cluster_list = sorted(list(cluster))
+            
+            # 计算聚类内部相似度的最小值
+            if len(cluster) > 1:
+                min_sim_in_cluster = float('inf')
+                for idx_a in cluster_list:
+                    for idx_b in cluster_list:
+                        if idx_a < idx_b:  # 避免重复计算
+                            sim = cos_sim_matrix[idx_a, idx_b].item()
+                            if sim < min_sim_in_cluster:
+                                min_sim_in_cluster = sim
+                print(f"  Cluster {i+1}: {cluster_list} - {len(cluster)} frames, min_sim={min_sim_in_cluster:.4f}{marker}")
+            else:
+                print(f"  Cluster {i+1}: {cluster_list} - {len(cluster)} frame{marker}")
         print(f"Valid frames: {valid_indices} ({len(valid_indices)}/{N})")
-        print(f"Rejected frames: {sorted(list(remaining))}")
+        print(f"Rejected frames: {sorted(list(rejected_set))}")
         
         # 打印相似度矩阵（调试用）
         if N <= 10:
-            print("Cosine similarity matrix:")
+            print("\nCosine similarity matrix:")
             for i in range(N):
                 row_str = " ".join([f"{cos_sim_matrix[i, j].item():.3f}" for j in range(N)])
-                marker = " *" if i in valid_set else ""
+                marker = " *" if i in largest_cluster else ""
                 print(f"  Frame {i}: [{row_str}]{marker}")
     
     # 清理

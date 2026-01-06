@@ -133,7 +133,8 @@ def run_model(target_dir, model, robust_mode=False, cos_thresh=0.5) -> dict:
             torch.cuda.empty_cache()
             return predictions
         
-        elif len(valid_indices) > 1:
+        elif len(valid_indices) < num_total_images and len(valid_indices) > 0:
+            # 有效相机数量少于总数量，需要进行第二次推理
             # 先用所有帧推理一次，获取被剔除帧的位姿
             print("First pass: getting poses for all frames...")
             with torch.no_grad():
