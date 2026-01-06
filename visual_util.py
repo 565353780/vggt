@@ -25,6 +25,7 @@ def predictions_to_glb(
     mask_sky=False,
     target_dir=None,
     prediction_mode="Predicted Pointmap",
+    robust_mode=False,
 ) -> trimesh.Scene:
     """
     Converts VGGT predictions to a 3D scene represented as a GLB file.
@@ -35,6 +36,7 @@ def predictions_to_glb(
             - world_points_conf: Confidence scores (S, H, W)
             - images: Input images (S, H, W, 3)
             - extrinsic: Camera extrinsic matrices (S, 3, 4)
+            - rejected_indices: (optional) 被剔除的帧索引
         conf_thres (float): Percentage of low-confidence points to filter out (default: 50.0)
         filter_by_frames (str): Frame filter specification (default: "all")
         mask_black_bg (bool): Mask out black background pixels (default: False)
@@ -43,6 +45,7 @@ def predictions_to_glb(
         mask_sky (bool): Apply sky segmentation mask (default: False)
         target_dir (str): Output directory for intermediate files (default: None)
         prediction_mode (str): Prediction mode selector (default: "Predicted Pointmap")
+        robust_mode (bool): 是否启用 robust 模式，被剔除的帧以红色显示 (default: False)
 
     Returns:
         trimesh.Scene: Processed 3D scene containing point cloud and cameras
@@ -83,6 +86,12 @@ def predictions_to_glb(
     images = predictions["images"]
     # Use extrinsic matrices instead of pred_extrinsic_list
     camera_matrices = predictions["extrinsic"]
+
+    # 获取被剔除的帧索引（用于 robust 模式）
+    rejected_indices = predictions.get("rejected_indices", np.array([], dtype=np.int64))
+    if rejected_indices is None:
+        rejected_indices = np.array([], dtype=np.int64)
+    rejected_set = set(rejected_indices.tolist()) if len(rejected_indices) > 0 else set()
 
     if mask_sky:
         if target_dir is not None:
@@ -148,6 +157,13 @@ def predictions_to_glb(
         colors_rgb = images
     colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
 
+    # Robust 模式：被剔除帧的点不显示（设置 confidence 为 0）
+    if robust_mode and len(rejected_set) > 0:
+        S, H, W = pred_world_points_conf.shape if hasattr(pred_world_points_conf, "shape") else (len(images), images.shape[1], images.shape[2])
+        # 将被剔除帧的置信度设为 0，这样它们会被后续的 conf_mask 过滤掉
+        for rej_idx in rejected_set:
+            pred_world_points_conf[rej_idx] = 0
+
     conf = pred_world_points_conf.reshape(-1)
     # Convert percentage threshold to actual confidence value
     if conf_thres == 0.0:
@@ -203,8 +219,17 @@ def predictions_to_glb(
         for i in range(num_cameras):
             world_to_camera = extrinsics_matrices[i]
             camera_to_world = np.linalg.inv(world_to_camera)
-            rgba_color = colormap(i / num_cameras)
-            current_color = tuple(int(255 * x) for x in rgba_color[:3])
+            
+            if robust_mode and len(rejected_set) > 0:
+                # Robust 模式：有效相机用青色，被剔除相机用红色
+                if i in rejected_set:
+                    current_color = (255, 0, 0)  # 纯红色 - 被剔除的相机
+                else:
+                    current_color = (0, 255, 255)  # 青色 - 有效的相机
+            else:
+                # 非 Robust 模式：使用彩虹色
+                rgba_color = colormap(i / num_cameras)
+                current_color = tuple(int(255 * x) for x in rgba_color[:3])
 
             integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
 

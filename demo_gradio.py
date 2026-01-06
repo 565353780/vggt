@@ -23,6 +23,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
+from robust_vggt import filter_valid_indices
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -32,7 +33,7 @@ print("Initializing and loading VGGT model...")
 model = VGGT()
 #_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
 #model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-model_file_path = os.environ["HOME"] + '/chLi/Model/VGGT/model.pt'
+model_file_path = os.environ["HOME"] + '/chLi/Model/VGGT/VGGT-1B/model.pt'
 model.load_state_dict(torch.load(model_file_path))
 
 
@@ -43,9 +44,14 @@ model = model.to(device)
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
-def run_model(target_dir, model) -> dict:
+def run_model(target_dir, model, robust_mode=False) -> dict:
     """
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
+    
+    Args:
+        target_dir: 图像目录
+        model: VGGT 模型
+        robust_mode: 是否启用 robust 模式，筛选有效帧
     """
     print(f"Processing images from {target_dir}")
 
@@ -72,6 +78,116 @@ def run_model(target_dir, model) -> dict:
     print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
+    # Robust mode: 使用 filter_valid_indices 筛选有效帧，然后二次推理
+    rejected_indices = []
+    rejected_extrinsics = None
+    num_total_images = images.shape[0]
+    
+    if robust_mode and num_total_images > 1:
+        print("Running robust mode filtering...")
+        valid_indices, _ = filter_valid_indices(images, model)
+        all_indices = set(range(num_total_images))
+        rejected_indices = sorted(list(all_indices - set(valid_indices)))
+        print(f"Robust mode: {len(valid_indices)} valid frames, {len(rejected_indices)} rejected frames")
+        print(f"Rejected frame indices: {rejected_indices}")
+        
+        if len(rejected_indices) > 0 and len(valid_indices) > 1:
+            # 先用所有帧推理一次，获取被剔除帧的位姿
+            print("First pass: getting poses for all frames...")
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    all_predictions = model(images)
+            
+            # 保存被剔除帧的位姿
+            all_extrinsic, _ = pose_encoding_to_extri_intri(all_predictions["pose_enc"], images.shape[-2:])
+            all_extrinsic_np = all_extrinsic.cpu().numpy().squeeze(0)  # (S, 3, 4)
+            rejected_extrinsics = {idx: all_extrinsic_np[idx] for idx in rejected_indices}
+            
+            del all_predictions
+            torch.cuda.empty_cache()
+            
+            # 用有效帧重新推理
+            print(f"Second pass: re-inferencing with {len(valid_indices)} valid frames...")
+            valid_images = images[valid_indices]
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    predictions = model(valid_images)
+            
+            # 转换位姿
+            valid_extrinsic, valid_intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], valid_images.shape[-2:])
+            
+            # 重建完整的 extrinsic 数组（有效帧用新位姿，被剔除帧用旧位姿）
+            full_extrinsic = np.zeros((num_total_images, 3, 4), dtype=np.float32)
+            full_intrinsic = np.zeros((num_total_images, 3, 3), dtype=np.float32)
+            
+            valid_extrinsic_np = valid_extrinsic.cpu().numpy().squeeze(0)
+            valid_intrinsic_np = valid_intrinsic.cpu().numpy().squeeze(0)
+            
+            for new_idx, orig_idx in enumerate(valid_indices):
+                full_extrinsic[orig_idx] = valid_extrinsic_np[new_idx]
+                full_intrinsic[orig_idx] = valid_intrinsic_np[new_idx]
+            
+            for orig_idx in rejected_indices:
+                full_extrinsic[orig_idx] = rejected_extrinsics[orig_idx]
+                # 使用第一个有效帧的 intrinsic 作为被剔除帧的 intrinsic
+                full_intrinsic[orig_idx] = valid_intrinsic_np[0]
+            
+            # 转换其他预测结果
+            for key in predictions.keys():
+                if isinstance(predictions[key], torch.Tensor):
+                    predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+            
+            # 重建完整的预测数组（被剔除帧的数据设为零或无效）
+            valid_depth = predictions["depth"]  # (S_valid, H, W, 1)
+            valid_depth_conf = predictions["depth_conf"]
+            valid_world_points = predictions.get("world_points")
+            valid_world_points_conf = predictions.get("world_points_conf")
+            valid_pred_images = predictions["images"]
+            
+            S_valid, H, W, _ = valid_depth.shape
+            
+            # 创建完整数组
+            full_depth = np.zeros((num_total_images, H, W, 1), dtype=valid_depth.dtype)
+            full_depth_conf = np.zeros((num_total_images, H, W), dtype=valid_depth_conf.dtype)
+            full_images = np.zeros((num_total_images,) + valid_pred_images.shape[1:], dtype=valid_pred_images.dtype)
+            
+            for new_idx, orig_idx in enumerate(valid_indices):
+                full_depth[orig_idx] = valid_depth[new_idx]
+                full_depth_conf[orig_idx] = valid_depth_conf[new_idx]
+                full_images[orig_idx] = valid_pred_images[new_idx]
+            
+            predictions["depth"] = full_depth
+            predictions["depth_conf"] = full_depth_conf
+            predictions["images"] = full_images
+            predictions["extrinsic"] = full_extrinsic
+            predictions["intrinsic"] = full_intrinsic
+            
+            if valid_world_points is not None:
+                full_world_points = np.zeros((num_total_images, H, W, 3), dtype=valid_world_points.dtype)
+                full_world_points_conf = np.zeros((num_total_images, H, W), dtype=valid_world_points_conf.dtype)
+                for new_idx, orig_idx in enumerate(valid_indices):
+                    full_world_points[orig_idx] = valid_world_points[new_idx]
+                    full_world_points_conf[orig_idx] = valid_world_points_conf[new_idx]
+                predictions["world_points"] = full_world_points
+                predictions["world_points_conf"] = full_world_points_conf
+            
+            predictions['pose_enc_list'] = None
+            
+            # 生成 world_points_from_depth（只对有效帧）
+            print("Computing world points from depth map...")
+            world_points = unproject_depth_map_to_point_map(full_depth, full_extrinsic, full_intrinsic)
+            predictions["world_points_from_depth"] = world_points
+            
+            # 存储被剔除帧索引和有效帧索引
+            predictions["rejected_indices"] = np.array(rejected_indices, dtype=np.int64)
+            predictions["valid_indices"] = np.array(valid_indices, dtype=np.int64)
+            
+            # Clean up
+            torch.cuda.empty_cache()
+            return predictions
+
+    # 正常推理（非 robust 模式或只有一帧）
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             predictions = model(images)
@@ -93,6 +209,10 @@ def run_model(target_dir, model) -> dict:
     depth_map = predictions["depth"]  # (S, H, W, 1)
     world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
     predictions["world_points_from_depth"] = world_points
+
+    # 存储被剔除的帧索引（用于可视化）
+    predictions["rejected_indices"] = np.array(rejected_indices) if rejected_indices else np.array([], dtype=np.int64)
+    predictions["valid_indices"] = np.array(list(range(num_total_images)), dtype=np.int64)
 
     # Clean up
     torch.cuda.empty_cache()
@@ -194,9 +314,13 @@ def gradio_demo(
     show_cam=True,
     mask_sky=False,
     prediction_mode="Pointmap Regression",
+    robust_mode=False,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
+    
+    Args:
+        robust_mode: 是否启用 robust vggt 模式，被剔除的帧以红色显示
     """
     if not os.path.isdir(target_dir) or target_dir == "None":
         return None, "No valid target directory found. Please upload first.", None, None
@@ -213,7 +337,7 @@ def gradio_demo(
 
     print("Running run_model...")
     with torch.no_grad():
-        predictions = run_model(target_dir, model)
+        predictions = run_model(target_dir, model, robust_mode=robust_mode)
 
     # Save predictions
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
@@ -226,7 +350,7 @@ def gradio_demo(
     # Build a GLB file name
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_robust{robust_mode}.glb",
     )
 
     # Convert predictions to GLB
@@ -240,6 +364,7 @@ def gradio_demo(
         mask_sky=mask_sky,
         target_dir=target_dir,
         prediction_mode=prediction_mode,
+        robust_mode=robust_mode,
     )
     glbscene.export(file_obj=glbfile)
 
@@ -273,7 +398,7 @@ def update_log():
 
 
 def update_visualization(
-    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example
+    target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, is_example, robust_mode=False
 ):
     """
     Reload saved predictions from npz, create (or reuse) the GLB for new parameters,
@@ -301,14 +426,28 @@ def update_visualization(
         "extrinsic",
         "intrinsic",
         "world_points_from_depth",
+        "rejected_indices",
+        "valid_indices",
     ]
 
-    loaded = np.load(predictions_path)
-    predictions = {key: np.array(loaded[key]) for key in key_list}
+    loaded = np.load(predictions_path, allow_pickle=True)
+    predictions = {}
+    for key in key_list:
+        if key in loaded:
+            predictions[key] = np.array(loaded[key])
+        elif key == "rejected_indices":
+            predictions[key] = np.array([], dtype=np.int64)
+        elif key == "valid_indices":
+            # 如果没有 valid_indices，假设所有帧都是有效的
+            if "images" in loaded:
+                num_frames = np.array(loaded["images"]).shape[0]
+                predictions[key] = np.array(list(range(num_frames)), dtype=np.int64)
+            else:
+                predictions[key] = np.array([], dtype=np.int64)
 
     glbfile = os.path.join(
         target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
+        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}_robust{robust_mode}.glb",
     )
 
     if not os.path.exists(glbfile):
@@ -322,6 +461,7 @@ def update_visualization(
             mask_sky=mask_sky,
             target_dir=target_dir,
             prediction_mode=prediction_mode,
+            robust_mode=robust_mode,
         )
         glbscene.export(file_obj=glbfile)
 
@@ -481,16 +621,17 @@ with gr.Blocks(
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
+                    robust_mode = gr.Checkbox(label="Robust VGGT Mode (红色显示被剔除的帧)", value=False)
 
     # ---------------------- Examples section ----------------------
     examples = [
-        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True"],
-        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
+        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
+        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
+        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", False, "True"],
+        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
+        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
+        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", False, "True"],
     ]
 
     def example_pipeline(
@@ -503,6 +644,7 @@ with gr.Blocks(
         show_cam,
         mask_sky,
         prediction_mode,
+        robust_mode_val,
         is_example_str,
     ):
         """
@@ -515,7 +657,7 @@ with gr.Blocks(
         # Always use "All" for frame_filter in examples
         frame_filter = "All"
         glbfile, log_msg, dropdown = gradio_demo(
-            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
+            target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode, robust_mode=robust_mode_val
         )
         return glbfile, log_msg, target_dir, dropdown, image_paths
 
@@ -533,6 +675,7 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            robust_mode,
             is_example,
         ],
         outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
@@ -561,6 +704,7 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            robust_mode,
         ],
         outputs=[reconstruction_output, log_output, frame_filter],
     ).then(
@@ -570,111 +714,28 @@ with gr.Blocks(
     # -------------------------------------------------------------------------
     # Real-time Visualization Updates
     # -------------------------------------------------------------------------
-    conf_thres.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    frame_filter.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    mask_black_bg.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    mask_white_bg.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    show_cam.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    mask_sky.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
-    prediction_mode.change(
-        update_visualization,
-        [
-            target_dir_output,
-            conf_thres,
-            frame_filter,
-            mask_black_bg,
-            mask_white_bg,
-            show_cam,
-            mask_sky,
-            prediction_mode,
-            is_example,
-        ],
-        [reconstruction_output, log_output],
-    )
+    visualization_inputs = [
+        target_dir_output,
+        conf_thres,
+        frame_filter,
+        mask_black_bg,
+        mask_white_bg,
+        show_cam,
+        mask_sky,
+        prediction_mode,
+        is_example,
+        robust_mode,
+    ]
+    visualization_outputs = [reconstruction_output, log_output]
+
+    conf_thres.change(update_visualization, visualization_inputs, visualization_outputs)
+    frame_filter.change(update_visualization, visualization_inputs, visualization_outputs)
+    mask_black_bg.change(update_visualization, visualization_inputs, visualization_outputs)
+    mask_white_bg.change(update_visualization, visualization_inputs, visualization_outputs)
+    show_cam.change(update_visualization, visualization_inputs, visualization_outputs)
+    mask_sky.change(update_visualization, visualization_inputs, visualization_outputs)
+    prediction_mode.change(update_visualization, visualization_inputs, visualization_outputs)
+    robust_mode.change(update_visualization, visualization_inputs, visualization_outputs)
 
     # -------------------------------------------------------------------------
     # Auto-update gallery whenever user uploads or changes their files

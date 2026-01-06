@@ -79,12 +79,19 @@ def filter_valid_indices(
     num_patch_tokens = h_patches * w_patches
     tokens_per_image = patch_start_idx + num_patch_tokens
     
-    # 设置 hooks 获取注意力权重
+    # 设置 hooks 获取注意力权重和 aggregated_tokens
     q_out: Dict[int, Tensor] = {}
     k_out: Dict[int, Tensor] = {}
+    aggregated_tokens_out: Dict[int, Tensor] = {}
     handles = []
     
     def _make_hook(store_dict: dict, layer_idx: int):
+        def _hook(_module, _inp, out):
+            store_dict[layer_idx] = out.detach()
+        return _hook
+    
+    def _make_block_hook(store_dict: dict, layer_idx: int):
+        """Hook for capturing block output (aggregated tokens)."""
         def _hook(_module, _inp, out):
             store_dict[layer_idx] = out.detach()
         return _hook
@@ -93,21 +100,50 @@ def filter_valid_indices(
     handles.append(blk.q_norm.register_forward_hook(_make_hook(q_out, target_layer)))
     handles.append(blk.k_norm.register_forward_hook(_make_hook(k_out, target_layer)))
     
+    # 添加 hook 来获取 global_blocks 的输出（aggregated tokens）
+    handles.append(model.aggregator.global_blocks[target_layer].register_forward_hook(
+        _make_block_hook(aggregated_tokens_out, target_layer)
+    ))
+    
     # 模型推理
     with torch.inference_mode():
         if device.type == "cuda":
             with torch.cuda.amp.autocast(dtype=dtype):
-                predictions, aggregated_tokens_list = model(images_device)
+                predictions = model(images_device)
         else:
-            predictions, aggregated_tokens_list = model(images_device)
+            predictions = model(images_device)
     
     # 移除 hooks
     for h in handles:
         h.remove()
     
     # ========== 计算余弦相似度 ==========
-    aggregated_tokens = aggregated_tokens_list[target_layer]
-    global_tokens = aggregated_tokens[..., 1024:]  # 提取全局 tokens
+    # 从 hook 获取 global block 的输出（即 global tokens）
+    if target_layer not in aggregated_tokens_out:
+        print(f"Warning: aggregated_tokens not captured for layer {target_layer}")
+        return list(range(num_images)), predictions
+    
+    # global_blocks 的输出形状是 (B, S*P, C)
+    global_block_output = aggregated_tokens_out[target_layer]
+    
+    # 需要重新 reshape 为 (B, S, P, C) 格式
+    B = 1  # batch size
+    S = num_images  # sequence length
+    C = global_block_output.shape[-1]
+    
+    if global_block_output.ndim == 2:
+        # shape: (S*P, C)
+        total_tokens = global_block_output.shape[0]
+        P = total_tokens // S
+        global_tokens = global_block_output.view(B, S, P, C)
+    elif global_block_output.ndim == 3:
+        # shape: (B, S*P, C) -> (B, S, P, C)
+        total_tokens = global_block_output.shape[1]
+        P = total_tokens // S
+        global_tokens = global_block_output.view(B, S, P, C)
+    else:
+        # 已经是 (B, S, P, C) 格式
+        global_tokens = global_block_output
     
     cos_sim_mean: Optional[Tensor] = None
     if global_tokens.ndim == 4:
@@ -178,7 +214,7 @@ def filter_valid_indices(
                 valid_indices.append(idx)
     
     # 清理
-    del q_out, k_out, aggregated_tokens_list
+    del q_out, k_out, aggregated_tokens_out
     _safe_empty_cache()
     
     # 转换 predictions 到 CPU

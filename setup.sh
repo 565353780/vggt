@@ -6,8 +6,10 @@ pip3 install torch torchvision torchaudio \
 
 pip install tqdm hydra-core omegaconf opencv-python \
   scipy onnxruntime requests trimesh matplotlib \
-  pillow huggingface_hub einops safetensors ninja
+  pillow huggingface_hub einops safetensors ninja \
+  plyfile evo
 
+pip install numpy==1.26.4
 pip install gradio==5.17.1
 pip install viser==0.2.23
 pip install pydantic==2.10.6
