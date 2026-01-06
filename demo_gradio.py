@@ -113,7 +113,11 @@ def run_model(target_dir, model, robust_mode=False, cos_thresh=0.5) -> dict:
             # Convert tensors to numpy
             for key in predictions.keys():
                 if isinstance(predictions[key], torch.Tensor):
-                    predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+                    # 先转换为 float32，因为 bfloat16 不支持直接转 numpy
+                    tensor = predictions[key].cpu()
+                    if tensor.dtype == torch.bfloat16:
+                        tensor = tensor.float()
+                    predictions[key] = tensor.numpy().squeeze(0)
             predictions['pose_enc_list'] = None
             
             # Generate world points from depth map
