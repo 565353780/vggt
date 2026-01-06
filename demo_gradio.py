@@ -667,7 +667,7 @@ with gr.Blocks(
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
-                    robust_mode = gr.Checkbox(label="Robust VGGT Mode (过滤无关帧并二次推理)", value=False)
+                    robust_mode = gr.Checkbox(label="Robust VGGT Mode (过滤无关帧并二次推理)", value=True)
                     cos_thresh = gr.Slider(minimum=0, maximum=1, value=0.5, step=0.01, 
                                            label="Robust Mode: 余弦相似度阈值", visible=True)
 
