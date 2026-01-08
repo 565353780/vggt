@@ -3,7 +3,6 @@ Robust VGGT: 基于注意力和特征相似度筛选有效帧的工具模块。
 """
 
 import gc
-import math
 import torch
 import torch.nn.functional as F
 
