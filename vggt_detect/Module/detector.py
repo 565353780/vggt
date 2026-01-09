@@ -251,6 +251,7 @@ class Detector(object):
         image_bounds: torch.Tensor,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
+        crop_bound_pixel_num: int=10,
     ) -> Optional[dict]:
         '''
         image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
@@ -291,7 +292,10 @@ class Detector(object):
 
         for i in range(pred_images.shape[0]):
             x1, y1, x2, y2 = image_bounds[i]
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            x1 = int(x1) + crop_bound_pixel_num
+            y1 = int(y1) + crop_bound_pixel_num
+            x2 = int(x2) - crop_bound_pixel_num
+            y2 = int(y2) - crop_bound_pixel_num
 
             # Crop image, depth and depth_conf
             cropped_images_list.append(pred_images[i, y1:y2, x1:x2, :])
