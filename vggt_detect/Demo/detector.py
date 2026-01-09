@@ -1,3 +1,6 @@
+import sys
+sys.path.append('../camera-control')
+
 import os
 
 from vggt_detect.Module.detector import Detector
