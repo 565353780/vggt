@@ -304,13 +304,13 @@ class Detector(object):
             adjusted_intrinsic[1, 2] -= y1  # cy
             adjusted_intrinsics_list.append(adjusted_intrinsic)
 
-        pred_images = cropped_images_list
-        depths = cropped_depths_list
-        depth_conf = cropped_depth_conf_list
+        pred_images = np.array(cropped_images_list)
+        depths = np.array(cropped_depths_list)
+        depth_conf = np.array(cropped_depth_conf_list)
         intrinsics = np.array(adjusted_intrinsics_list)
 
         extrinsic_44_list = []
-        for i in range(len(pred_images)):
+        for i in range(pred_images.shape[0]):
             extrinsic_44 = np.zeros((4, 4), dtype=extrinsics.dtype)
             extrinsic_44[:3, :4] = extrinsics[i]
             extrinsic_44[3, :] = np.array([0, 0, 0, 1], dtype=extrinsics.dtype)
@@ -319,7 +319,7 @@ class Detector(object):
 
         print('start create cameras...')
         camera_list = []
-        for i in range(len(pred_images)):
+        for i in range(pred_images.shape[0]):
             camera = Camera.fromVGGTPose(extrinsics[i], intrinsics[i])
             camera_list.append(camera)
 
