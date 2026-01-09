@@ -344,6 +344,7 @@ class Detector(object):
             return None
 
         image_file_name_list = os.listdir(image_folder_path)
+        image_file_name_list.sort()
 
         image_file_path_list = []
         for image_file_name in image_file_name_list:
