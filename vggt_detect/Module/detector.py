@@ -375,7 +375,6 @@ class Detector(object):
         image_folder_path: str,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-        crop_padding: bool=True,
     ) -> Optional[dict]:
         '''
         Args:
@@ -404,6 +403,5 @@ class Detector(object):
             image_file_path_list,
             robust_mode,
             cos_thresh,
-            crop_padding,
         )
         return predictions
