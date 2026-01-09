@@ -3,6 +3,9 @@ import torch
 import numpy as np
 from typing import Optional
 
+from camera_control.Module.camera import Camera
+from camera_control.Module.camera_convertor import CameraConvertor
+
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -43,33 +46,17 @@ class Detector(object):
         return True
 
     @torch.no_grad()
-    def detectImageFolder(
+    def detect(
         self,
-        image_folder_path: str,
-        mode: str='pad',
+        images: torch.Tensor,
         robust_mode: bool=True,
-        cos_thresh: float=0.9,
+        cos_thresh: float=0.95,
     ) -> Optional[dict]:
-        assert mode in ['crop', 'pad']
-
-        if not os.path.exists(image_folder_path):
-            print('[ERROR][Detector::detectImageFolder]')
-            print('\t image folder not exist!')
-            print('\t image_folder_path:', image_folder_path)
+        if images.shape[0] == 0:
+            print('[ERROR][Detector::detect]')
+            print("\t images are empty!")
             return None
 
-        image_file_name_list = os.listdir(image_folder_path)
-
-        image_file_path_list = []
-        for image_file_name in image_file_name_list:
-            if image_file_name.split('.')[-1] not in ['png', 'jpg', 'jpeg']:
-                continue
-
-            image_file_path_list.append(image_folder_path + image_file_name)
-
-        print(f"Found {len(image_file_path_list)} images")
-
-        images = load_and_preprocess_images(image_file_path_list, mode=mode).to(self.device)
         print(f"Preprocessed images shape: {images.shape}")
 
         # Run inference
@@ -256,4 +243,119 @@ class Detector(object):
 
         # Clean up
         torch.cuda.empty_cache()
+        return predictions
+
+    @torch.no_grad()
+    def detectImages(
+        self,
+        images: torch.Tensor,
+        robust_mode: bool=True,
+        cos_thresh: float=0.95,
+    ) -> Optional[dict]:
+        if images.shape[0] == 0:
+            print('[WARN][Detector::detectImages]')
+            print("\t images are empty!")
+            return None
+
+        predictions = self.detect(
+            images,
+            robust_mode,
+            cos_thresh,
+        )
+
+        if predictions is None:
+            return predictions
+
+        images = predictions['images'] # N, 3, H, W
+        depths = predictions['depth'] # N, H, W
+        extrinsics = predictions['extrinsic'] # N, 3, 4
+        intrinsics = predictions['intrinsic'] # N, 3, 3
+
+        images = (np.transpose(images, (0, 2, 3, 1)) * 255.0).astype(np.uint8)[..., ::-1]
+        depths = depths.reshape(*images.shape[:3])
+
+        extrinsic_44 = np.zeros((images.shape[0], 4, 4), dtype=extrinsics.dtype)
+        extrinsic_44[:, :3, :4] = extrinsics
+        extrinsic_44[:, 3, :] = np.array([0, 0, 0, 1], dtype=extrinsics.dtype)
+        extrinsics = extrinsic_44
+
+        predictions['images'] = images
+        predictions['depth'] = depths
+        predictions['extrinsic'] = extrinsics
+
+        print('start create cameras...')
+        camera_list = []
+        for i in range(images.shape[0]):
+            camera = Camera.fromVGGTPose(extrinsics[i], intrinsics[i])
+            camera_list.append(camera)
+
+        clean_predictions = {
+            'cameras': camera_list,
+            'images': images,
+            'depth': depths,
+            'depth_conf': predictions['depth_conf'],
+        }
+        return clean_predictions
+
+    @torch.no_grad()
+    def detectImageFiles(
+        self,
+        image_file_path_list: list,
+        mode: str='pad',
+        robust_mode: bool=True,
+        cos_thresh: float=0.95,
+    ) -> Optional[dict]:
+        assert mode in ['crop', 'pad']
+
+        if len(image_file_path_list) == 0:
+            print('[WARN][Detector::detectImageFiles]')
+            print("\t images are empty!")
+            return None
+
+        print(f"Found {len(image_file_path_list)} images")
+
+        images = load_and_preprocess_images(image_file_path_list, mode=mode).to(self.device)
+
+        if images.shape[0] == 0:
+            print('[WARN][Detector::detectImageFiles]')
+            print("\t images not found!")
+            return None
+
+        return self.detectImages(
+            images,
+            robust_mode,
+            cos_thresh,
+        )
+
+    @torch.no_grad()
+    def detectImageFolder(
+        self,
+        image_folder_path: str,
+        mode: str='pad',
+        robust_mode: bool=True,
+        cos_thresh: float=0.95,
+    ) -> Optional[dict]:
+        assert mode in ['crop', 'pad']
+
+        if not os.path.exists(image_folder_path):
+            print('[ERROR][Detector::detectImageFolder]')
+            print('\t image folder not exist!')
+            print('\t image_folder_path:', image_folder_path)
+            return None
+
+        image_file_name_list = os.listdir(image_folder_path)
+
+        image_file_path_list = []
+        for image_file_name in image_file_name_list:
+            if image_file_name.split('.')[-1] not in ['png', 'jpg', 'jpeg']:
+                continue
+
+            image_file_path_list.append(image_folder_path + image_file_name)
+
+        predictions = self.detectImageFiles(
+            image_file_path_list,
+            mode,
+            robust_mode,
+            cos_thresh,
+        )
         return predictions
