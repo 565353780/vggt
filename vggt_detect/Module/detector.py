@@ -248,9 +248,14 @@ class Detector(object):
     def detectImages(
         self,
         images: torch.Tensor,
+        image_bounds: torch.Tensor,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
     ) -> Optional[dict]:
+        '''
+        image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
+                      indicating the pixel bounds of the original image content in the input tensor.
+        '''
         if images.shape[0] == 0:
             print('[WARN][Detector::detectImages]')
             print("\t images are empty!")
@@ -265,34 +270,64 @@ class Detector(object):
         if predictions is None:
             return predictions
 
-        images = predictions['images'] # N, 3, H, W
-        depths = predictions['depth'] # N, H, W
+        pred_images = predictions['images'] # N, 3, H, W
+        depths = predictions['depth'] # N, H, W, 1
+        depth_conf = predictions['depth_conf'] # N, H, W
         extrinsics = predictions['extrinsic'] # N, 3, 4
         intrinsics = predictions['intrinsic'] # N, 3, 3
 
-        images = (np.transpose(images, (0, 2, 3, 1)) * 255.0).astype(np.uint8)[..., ::-1]
-        depths = depths.reshape(*images.shape[:3])
+        pred_images = (np.transpose(pred_images, (0, 2, 3, 1)) * 255.0).astype(np.uint8)[..., ::-1]
+        depths = depths.reshape(*pred_images.shape[:3])
 
-        extrinsic_44 = np.zeros((images.shape[0], 4, 4), dtype=extrinsics.dtype)
-        extrinsic_44[:, :3, :4] = extrinsics
-        extrinsic_44[:, 3, :] = np.array([0, 0, 0, 1], dtype=extrinsics.dtype)
-        extrinsics = extrinsic_44
+        # Crop predictions based on image_bounds to remove padding
+        print('Cropping predictions based on image_bounds...')
+        if isinstance(image_bounds, torch.Tensor):
+            image_bounds = image_bounds.numpy()
 
-        predictions['images'] = images
-        predictions['depth'] = depths
-        predictions['extrinsic'] = extrinsics
+        cropped_images_list = []
+        cropped_depths_list = []
+        cropped_depth_conf_list = []
+        adjusted_intrinsics_list = []
+
+        for i in range(pred_images.shape[0]):
+            x1, y1, x2, y2 = image_bounds[i]
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+
+            # Crop image, depth and depth_conf
+            cropped_images_list.append(pred_images[i, y1:y2, x1:x2, :])
+            cropped_depths_list.append(depths[i, y1:y2, x1:x2])
+            cropped_depth_conf_list.append(depth_conf[i, y1:y2, x1:x2])
+
+            # Adjust intrinsic matrix (shift principal point)
+            adjusted_intrinsic = intrinsics[i].copy()
+            adjusted_intrinsic[0, 2] -= x1  # cx
+            adjusted_intrinsic[1, 2] -= y1  # cy
+            adjusted_intrinsics_list.append(adjusted_intrinsic)
+
+        pred_images = cropped_images_list
+        depths = cropped_depths_list
+        depth_conf = cropped_depth_conf_list
+        intrinsics = np.array(adjusted_intrinsics_list)
+
+        extrinsic_44_list = []
+        for i in range(len(pred_images)):
+            extrinsic_44 = np.zeros((4, 4), dtype=extrinsics.dtype)
+            extrinsic_44[:3, :4] = extrinsics[i]
+            extrinsic_44[3, :] = np.array([0, 0, 0, 1], dtype=extrinsics.dtype)
+            extrinsic_44_list.append(extrinsic_44)
+        extrinsics = np.array(extrinsic_44_list)
 
         print('start create cameras...')
         camera_list = []
-        for i in range(images.shape[0]):
+        for i in range(len(pred_images)):
             camera = Camera.fromVGGTPose(extrinsics[i], intrinsics[i])
             camera_list.append(camera)
 
         clean_predictions = {
             'cameras': camera_list,
-            'images': images,
+            'images': pred_images,
             'depth': depths,
-            'depth_conf': predictions['depth_conf'],
+            'depth_conf': depth_conf,
         }
         return clean_predictions
 
@@ -300,12 +335,16 @@ class Detector(object):
     def detectImageFiles(
         self,
         image_file_path_list: list,
-        mode: str='crop',
         robust_mode: bool=True,
         cos_thresh: float=0.95,
     ) -> Optional[dict]:
-        assert mode in ['crop', 'pad']
-
+        '''
+        Args:
+            image_file_path_list: List of image file paths
+            robust_mode: Whether to use robust mode filtering
+            cos_thresh: Cosine threshold for robust mode
+            crop_padding: If True, crop out the padding area from predictions to get original image regions
+        '''
         if len(image_file_path_list) == 0:
             print('[WARN][Detector::detectImageFiles]')
             print("\t images are empty!")
@@ -313,29 +352,38 @@ class Detector(object):
 
         print(f"Found {len(image_file_path_list)} images")
 
-        images = load_and_preprocess_images(image_file_path_list, mode=mode).to(self.device)
+        images, image_bounds = load_and_preprocess_images(image_file_path_list)
+        images = images.to(self.device)
 
         if images.shape[0] == 0:
             print('[WARN][Detector::detectImageFiles]')
             print("\t images not found!")
             return None
 
-        return self.detectImages(
+        predictions = self.detectImages(
             images,
+            image_bounds,
             robust_mode,
             cos_thresh,
         )
+
+        return predictions
 
     @torch.no_grad()
     def detectImageFolder(
         self,
         image_folder_path: str,
-        mode: str='crop',
         robust_mode: bool=True,
         cos_thresh: float=0.95,
+        crop_padding: bool=True,
     ) -> Optional[dict]:
-        assert mode in ['crop', 'pad']
-
+        '''
+        Args:
+            image_folder_path: Path to folder containing images
+            robust_mode: Whether to use robust mode filtering
+            cos_thresh: Cosine threshold for robust mode
+            crop_padding: If True, crop out the padding area from predictions to get original image regions
+        '''
         if not os.path.exists(image_folder_path):
             print('[ERROR][Detector::detectImageFolder]')
             print('\t image folder not exist!')
@@ -354,8 +402,8 @@ class Detector(object):
 
         predictions = self.detectImageFiles(
             image_file_path_list,
-            mode,
             robust_mode,
             cos_thresh,
+            crop_padding,
         )
         return predictions

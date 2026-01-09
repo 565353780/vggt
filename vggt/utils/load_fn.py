@@ -94,7 +94,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     return images, original_coords
 
 
-def load_and_preprocess_images(image_path_list, mode="crop"):
+def load_and_preprocess_images(image_path_list):
     """
     A quick start function to load and preprocess images for model input.
     This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
@@ -105,9 +105,14 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
                              - "crop" (default): Sets width to 518px and center crops height if needed.
                              - "pad": Preserves all pixels by making the largest dimension 518px
                                and padding the smaller dimension to reach a square shape.
+        return_bounds (bool, optional): If True, also return the bounds of original image pixels
+                                        in the output tensor. Defaults to False.
 
     Returns:
         torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
+        If return_bounds=True, also returns:
+            torch.Tensor: Array of shape (N, 4) containing [x1, y1, x2, y2] for each image,
+                          indicating the pixel bounds of the original image content in the output tensor.
 
     Raises:
         ValueError: If the input list is empty or if mode is invalid
@@ -125,12 +130,9 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
 
-    # Validate mode
-    if mode not in ["crop", "pad"]:
-        raise ValueError("Mode must be either 'crop' or 'pad'")
-
     images = []
     shapes = set()
+    image_bounds = []  # Store the bounds of original pixels in output tensor
     to_tensor = TF.ToTensor()
     target_size = 518
 
@@ -151,47 +153,48 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
 
         width, height = img.size
 
-        if mode == "pad":
-            # Make the largest dimension 518px while maintaining aspect ratio
-            if width >= height:
-                new_width = target_size
-                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
-            else:
-                new_height = target_size
-                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
-        else:  # mode == "crop"
-            # Original behavior: set width to 518px
+        # Make the largest dimension 518px while maintaining aspect ratio
+        if width >= height:
             new_width = target_size
-            # Calculate height maintaining aspect ratio, divisible by 14
-            new_height = round(height * (new_width / width) / 14) * 14
+            new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
+        else:
+            new_height = target_size
+            new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
 
         # Resize with new dimensions (width, height)
         img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
         img = to_tensor(img)  # Convert to tensor (0, 1)
 
-        # Center crop height if it's larger than 518 (only in crop mode)
-        if mode == "crop" and new_height > target_size:
-            start_y = (new_height - target_size) // 2
-            img = img[:, start_y : start_y + target_size, :]
+        # Initialize bounds for this image (will be updated based on processing)
+        x1, y1, x2, y2 = 0, 0, new_width, new_height
 
         # For pad mode, pad to make a square of target_size x target_size
-        if mode == "pad":
-            h_padding = target_size - img.shape[1]
-            w_padding = target_size - img.shape[2]
+        h_padding = target_size - img.shape[1]
+        w_padding = target_size - img.shape[2]
 
-            if h_padding > 0 or w_padding > 0:
-                pad_top = h_padding // 2
-                pad_bottom = h_padding - pad_top
-                pad_left = w_padding // 2
-                pad_right = w_padding - pad_left
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
 
-                # Pad with white (value=1.0)
-                img = torch.nn.functional.pad(
-                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
-                )
+            # Update bounds to reflect padding offset
+            x1 = pad_left
+            y1 = pad_top
+            x2 = pad_left + new_width
+            y2 = pad_top + new_height
+
+            # Pad with white (value=1.0)
+            img = torch.nn.functional.pad(
+                img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+            )
+        else:
+            # No padding needed, bounds are the full image
+            x1, y1, x2, y2 = 0, 0, new_width, new_height
 
         shapes.add((img.shape[1], img.shape[2]))
         images.append(img)
+        image_bounds.append([x1, y1, x2, y2])
 
     # Check if we have different shapes
     # In theory our model can also work well with different shapes
@@ -203,7 +206,8 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
 
         # Pad images if necessary
         padded_images = []
-        for img in images:
+        new_image_bounds = []
+        for i, img in enumerate(images):
             h_padding = max_height - img.shape[1]
             w_padding = max_width - img.shape[2]
 
@@ -213,13 +217,25 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
                 pad_left = w_padding // 2
                 pad_right = w_padding - pad_left
 
+                # Update bounds to reflect additional padding
+                x1, y1, x2, y2 = image_bounds[i]
+                x1 += pad_left
+                x2 += pad_left
+                y1 += pad_top
+                y2 += pad_top
+                new_image_bounds.append([x1, y1, x2, y2])
+
                 img = torch.nn.functional.pad(
                     img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
                 )
+            else:
+                new_image_bounds.append(image_bounds[i])
             padded_images.append(img)
         images = padded_images
+        image_bounds = new_image_bounds
 
     images = torch.stack(images)  # concatenate images
+    image_bounds = torch.tensor(image_bounds, dtype=torch.int64)  # (N, 4)
 
     # Ensure correct shape when single image
     if len(image_path_list) == 1:
@@ -227,4 +243,4 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         if images.dim() == 3:
             images = images.unsqueeze(0)
 
-    return images
+    return images, image_bounds
