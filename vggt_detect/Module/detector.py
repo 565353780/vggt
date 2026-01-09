@@ -251,7 +251,7 @@ class Detector(object):
         image_bounds: torch.Tensor,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-        crop_bound_pixel_num: int=10,
+        crop_bound_pixel_num: int=1,
     ) -> Optional[dict]:
         '''
         image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
