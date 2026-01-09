@@ -11,7 +11,7 @@ def demo():
     model_file_path = home + '/chLi/Model/VGGT/VGGT-1B/model.pt'
     device = 'cuda:0'
     image_folder_path = home + '/chLi/Dataset/GS/haizei_1/input/images/'
-    mode = 'pad'
+    mode = 'crop'
     robust_mode = True
     cos_thresh = 0.95
 

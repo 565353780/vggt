@@ -4,7 +4,6 @@ import numpy as np
 from typing import Optional
 
 from camera_control.Module.camera import Camera
-from camera_control.Module.camera_convertor import CameraConvertor
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -301,7 +300,7 @@ class Detector(object):
     def detectImageFiles(
         self,
         image_file_path_list: list,
-        mode: str='pad',
+        mode: str='crop',
         robust_mode: bool=True,
         cos_thresh: float=0.95,
     ) -> Optional[dict]:
@@ -331,7 +330,7 @@ class Detector(object):
     def detectImageFolder(
         self,
         image_folder_path: str,
-        mode: str='pad',
+        mode: str='crop',
         robust_mode: bool=True,
         cos_thresh: float=0.95,
     ) -> Optional[dict]:
