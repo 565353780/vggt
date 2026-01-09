@@ -314,7 +314,7 @@ class Detector(object):
         intrinsics = adjusted_intrinsics_list
 
         extrinsic_44_list = []
-        for i in range(pred_images.shape[0]):
+        for i in range(len(pred_images)):
             extrinsic_44 = np.zeros((4, 4), dtype=extrinsics.dtype)
             extrinsic_44[:3, :4] = extrinsics[i]
             extrinsic_44[3, :] = np.array([0, 0, 0, 1], dtype=extrinsics.dtype)
@@ -323,7 +323,7 @@ class Detector(object):
 
         print('start create cameras...')
         camera_list = []
-        for i in range(pred_images.shape[0]):
+        for i in range(len(pred_images)):
             camera = RGBDCamera.fromVGGTPose(extrinsics[i], intrinsics[i])
 
             camera.loadImage(pred_images[i])
