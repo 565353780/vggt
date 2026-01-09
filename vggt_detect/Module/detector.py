@@ -1,9 +1,9 @@
 import os
 import torch
 import numpy as np
-from typing import Optional
+from typing import Optional, List
 
-from camera_control.Module.depth_camera import DepthCamera
+from camera_control.Module.rgbd_camera import RGBDCamera
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -252,7 +252,7 @@ class Detector(object):
         robust_mode: bool=True,
         cos_thresh: float=0.95,
         crop_bound_pixel_num: int=1,
-    ) -> Optional[dict]:
+    ) -> Optional[List[RGBDCamera]]:
         '''
         image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
                       indicating the pixel bounds of the original image content in the input tensor.
@@ -308,10 +308,10 @@ class Detector(object):
             adjusted_intrinsic[1, 2] -= y1  # cy
             adjusted_intrinsics_list.append(adjusted_intrinsic)
 
-        pred_images = np.array(cropped_images_list)
-        depths = np.array(cropped_depths_list)
-        depth_conf = np.array(cropped_depth_conf_list)
-        intrinsics = np.array(adjusted_intrinsics_list)
+        pred_images = cropped_images_list
+        depths = cropped_depths_list
+        depth_conf = cropped_depth_conf_list
+        intrinsics = adjusted_intrinsics_list
 
         extrinsic_44_list = []
         for i in range(pred_images.shape[0]):
@@ -319,22 +319,20 @@ class Detector(object):
             extrinsic_44[:3, :4] = extrinsics[i]
             extrinsic_44[3, :] = np.array([0, 0, 0, 1], dtype=extrinsics.dtype)
             extrinsic_44_list.append(extrinsic_44)
-        extrinsics = np.array(extrinsic_44_list)
+        extrinsics = extrinsic_44_list
 
         print('start create cameras...')
         camera_list = []
         for i in range(pred_images.shape[0]):
-            camera = DepthCamera.fromVGGTPose(extrinsics[i], intrinsics[i])
+            camera = RGBDCamera.fromVGGTPose(extrinsics[i], intrinsics[i])
+
+            camera.loadImage(pred_images[i])
 
             camera.loadDepth(depths[i], depth_conf[i])
 
             camera_list.append(camera)
 
-        clean_predictions = {
-            'cameras': camera_list,
-            'images': pred_images,
-        }
-        return clean_predictions
+        return camera_list
 
     @torch.no_grad()
     def detectImageFiles(
@@ -342,7 +340,7 @@ class Detector(object):
         image_file_path_list: list,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-    ) -> Optional[dict]:
+    ) -> Optional[List[RGBDCamera]]:
         '''
         Args:
             image_file_path_list: List of image file paths
@@ -365,14 +363,14 @@ class Detector(object):
             print("\t images not found!")
             return None
 
-        predictions = self.detectImages(
+        camera_list = self.detectImages(
             images,
             image_bounds,
             robust_mode,
             cos_thresh,
         )
 
-        return predictions
+        return camera_list
 
     @torch.no_grad()
     def detectImageFolder(
@@ -380,7 +378,7 @@ class Detector(object):
         image_folder_path: str,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-    ) -> Optional[dict]:
+    ) -> Optional[List[RGBDCamera]]:
         '''
         Args:
             image_folder_path: Path to folder containing images
@@ -404,9 +402,9 @@ class Detector(object):
 
             image_file_path_list.append(image_folder_path + image_file_name)
 
-        predictions = self.detectImageFiles(
+        camera_list = self.detectImageFiles(
             image_file_path_list,
             robust_mode,
             cos_thresh,
         )
-        return predictions
+        return camera_list
