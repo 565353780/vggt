@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from typing import Optional
 
-from camera_control.Module.camera import Camera
+from camera_control.Module.depth_camera import DepthCamera
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -324,14 +324,15 @@ class Detector(object):
         print('start create cameras...')
         camera_list = []
         for i in range(pred_images.shape[0]):
-            camera = Camera.fromVGGTPose(extrinsics[i], intrinsics[i])
+            camera = DepthCamera.fromVGGTPose(extrinsics[i], intrinsics[i])
+
+            camera.loadDepth(depths[i], depth_conf[i])
+
             camera_list.append(camera)
 
         clean_predictions = {
             'cameras': camera_list,
             'images': pred_images,
-            'depth': depths,
-            'depth_conf': depth_conf,
         }
         return clean_predictions
 
