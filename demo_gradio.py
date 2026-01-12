@@ -148,9 +148,9 @@ def gradio_demo(
     print("Running detectImageFolder...")
     predictions = detector.detectImageFolder(
         image_folder_path=target_dir_images,
-        mode='pad',
         robust_mode=robust_mode,
         cos_thresh=cos_thresh,
+        return_dict=True,
     )
     assert predictions is not None
 

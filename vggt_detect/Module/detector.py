@@ -252,6 +252,7 @@ class Detector(object):
         robust_mode: bool=True,
         cos_thresh: float=0.95,
         crop_bound_pixel_num: int=1,
+        return_dict: bool=False,
     ) -> Optional[List[RGBDCamera]]:
         '''
         image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
@@ -267,6 +268,9 @@ class Detector(object):
             robust_mode,
             cos_thresh,
         )
+
+        if return_dict:
+            return predictions
 
         if predictions is None:
             return predictions
@@ -340,6 +344,7 @@ class Detector(object):
         image_file_path_list: list,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
+        return_dict: bool=False,
     ) -> Optional[List[RGBDCamera]]:
         '''
         Args:
@@ -363,14 +368,13 @@ class Detector(object):
             print("\t images not found!")
             return None
 
-        camera_list = self.detectImages(
+        return self.detectImages(
             images,
             image_bounds,
             robust_mode,
             cos_thresh,
+            return_dict=return_dict,
         )
-
-        return camera_list
 
     @torch.no_grad()
     def detectImageFolder(
@@ -378,6 +382,7 @@ class Detector(object):
         image_folder_path: str,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
+        return_dict: bool=False,
     ) -> Optional[List[RGBDCamera]]:
         '''
         Args:
@@ -402,9 +407,9 @@ class Detector(object):
 
             image_file_path_list.append(image_folder_path + image_file_name)
 
-        camera_list = self.detectImageFiles(
+        return self.detectImageFiles(
             image_file_path_list,
             robust_mode,
             cos_thresh,
+            return_dict,
         )
-        return camera_list
