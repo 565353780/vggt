@@ -277,7 +277,7 @@ class Detector(object):
         extrinsics = predictions['extrinsic'] # N, 3, 4
         intrinsics = predictions['intrinsic'] # N, 3, 3
 
-        pred_images = (np.transpose(pred_images, (0, 2, 3, 1)) * 255.0).astype(np.uint8)[..., ::-1]
+        pred_images = np.transpose(pred_images, (0, 2, 3, 1))
         depths = depths.reshape(*pred_images.shape[:3])
 
         # Crop predictions based on image_bounds to remove padding
