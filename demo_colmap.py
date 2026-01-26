@@ -4,12 +4,12 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import random
-import numpy as np
-import glob
 import os
 import copy
+import glob
 import torch
+import random
+import numpy as np
 import torch.nn.functional as F
 
 # Configure CUDA settings
@@ -17,10 +17,9 @@ torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
-import argparse
-from pathlib import Path
 import trimesh
 import pycolmap
+import argparse
 
 
 from vggt.models.vggt import VGGT
