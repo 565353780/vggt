@@ -1,22 +1,31 @@
 import os
 import torch
 import numpy as np
-from typing import Optional, List
+from shutil import rmtree
+from typing import Optional, List, Dict, Union
 
-from camera_control.Module.rgbd_camera import RGBDCamera
+from camera_control.Method.data import toTensor
+from camera_control.Module.camera import Camera
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from robust_vggt import filter_valid_indices
+import pycolmap
+from vggt.dependency.track_predict import predict_tracks
+from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, pycolmap_to_batch_np_matrix
+
+from vggt_detect.Method.video import videoToImages
 
 class Detector(object):
     def __init__(
         self,
         model_file_path: Optional[str]=None,
+        vggsfm_model_file_path: Optional[str]=None,
         device: str = 'cuda:0',
     ) -> None:
+        self.vggsfm_model_file_path = vggsfm_model_file_path
         self.device = device
 
         self.model = VGGT()
@@ -253,7 +262,7 @@ class Detector(object):
         cos_thresh: float=0.95,
         crop_bound_pixel_num: int=1,
         return_dict: bool=False,
-    ) -> Optional[List[RGBDCamera]]:
+    ) -> Optional[Union[List[Camera], Dict]]:
         '''
         image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
                       indicating the pixel bounds of the original image content in the input tensor.
@@ -269,17 +278,25 @@ class Detector(object):
             cos_thresh,
         )
 
-        if return_dict:
-            return predictions
-
         if predictions is None:
-            return predictions
+            return None
 
-        pred_images = predictions['images'] # N, 3, H, W
-        depths = predictions['depth'] # N, H, W, 1
-        depth_conf = predictions['depth_conf'] # N, H, W
-        extrinsics = predictions['extrinsic'] # N, 3, 4
-        intrinsics = predictions['intrinsic'] # N, 3, 3
+        optimized_predictions = self.optimizeCameraPosesByBA(
+            predictions=predictions,
+            images=predictions['images'],
+        )
+
+        if optimized_predictions is None:
+            return None
+
+        if return_dict:
+            return optimized_predictions
+
+        pred_images = optimized_predictions['images'] # N, 3, H, W
+        depths = optimized_predictions['depth'] # N, H, W, 1
+        depth_conf = optimized_predictions['depth_conf'] # N, H, W
+        extrinsics = optimized_predictions['extrinsic'] # N, 3, 4
+        intrinsics = optimized_predictions['intrinsic'] # N, 3, 3
 
         pred_images = np.transpose(pred_images, (0, 2, 3, 1))
         depths = depths.reshape(*pred_images.shape[:3])
@@ -328,7 +345,7 @@ class Detector(object):
         print('start create cameras...')
         camera_list = []
         for i in range(len(pred_images)):
-            camera = RGBDCamera.fromVGGTPose(extrinsics[i], intrinsics[i])
+            camera = Camera.fromVGGTPose(extrinsics[i], intrinsics[i], device='cpu')
 
             camera.loadImage(pred_images[i])
 
@@ -345,7 +362,7 @@ class Detector(object):
         robust_mode: bool=True,
         cos_thresh: float=0.95,
         return_dict: bool=False,
-    ) -> Optional[List[RGBDCamera]]:
+    ) -> Optional[Union[List[Camera], Dict]]:
         '''
         Args:
             image_file_path_list: List of image file paths
@@ -383,7 +400,7 @@ class Detector(object):
         robust_mode: bool=True,
         cos_thresh: float=0.95,
         return_dict: bool=False,
-    ) -> Optional[List[RGBDCamera]]:
+    ) -> Optional[Union[List[Camera], Dict]]:
         '''
         Args:
             image_folder_path: Path to folder containing images
@@ -413,3 +430,172 @@ class Detector(object):
             cos_thresh,
             return_dict,
         )
+
+    @torch.no_grad()
+    def detectVideoFile(
+        self,
+        video_file_path: str,
+        save_image_folder_path: str,
+        robust_mode: bool=True,
+        cos_thresh: float=0.95,
+        return_dict: bool=False,
+        target_image_num: int=100,
+    ) -> Optional[Union[List[Camera], Dict]]:
+        if not os.path.exists(video_file_path):
+            print('[ERROR][Detector::detectVideoFile]')
+            print('\t video file not exist!')
+            print('\t video_file_path:', video_file_path)
+            return None
+
+        if os.path.exists(save_image_folder_path):
+            rmtree(save_image_folder_path)
+
+        os.makedirs(save_image_folder_path, exist_ok=True)
+
+        if not videoToImages(
+            video_file_path,
+            save_image_folder_path,
+            target_image_num=target_image_num,
+            scale=1,
+            print_progress=True,
+        ):
+            print('[ERROR][Detector::detectVideoFile]')
+            print('\t videoToImages failed!')
+            print('\t video_file_path:', video_file_path)
+            return None
+
+        return self.detectImageFolder(
+            save_image_folder_path,
+            robust_mode=robust_mode,
+            cos_thresh=cos_thresh,
+            return_dict=return_dict,
+        )
+
+    @torch.no_grad()
+    def optimizeCameraPosesByBA(
+        self,
+        predictions: Dict,
+        images: torch.Tensor,
+        max_reproj_error: float = 8.0,
+        shared_camera: bool = False,
+        camera_type: str = "SIMPLE_PINHOLE",
+        vis_thresh: float = 0.2,
+        max_query_pts: int = 4096,
+        query_frame_num: int = 8,
+        fine_tracking: bool = True,
+    ) -> Optional[Dict]:
+        """
+        使用 Bundle Adjustment 优化相机位姿
+
+        Args:
+            predictions: detect 方法返回的预测结果字典，包含：
+                - extrinsic: (N, 3, 4) 相机外参
+                - intrinsic: (N, 3, 3) 相机内参
+                - depth: (N, H, W, 1) 深度图
+                - depth_conf: (N, H, W) 深度置信度
+                - world_points_from_depth: (N, H, W, 3) 从深度图反投影的3D点
+            images: torch.Tensor of shape (N, 3, H, W) 输入图像
+            max_reproj_error: 最大重投影误差阈值，默认 8.0
+            shared_camera: 是否所有图像共享同一个相机参数，默认 False
+            camera_type: 相机类型，默认 "SIMPLE_PINHOLE"
+            vis_thresh: 轨迹可见性阈值，默认 0.2
+            max_query_pts: 最大查询点数，默认 4096
+            query_frame_num: 查询帧数，默认 8
+            fine_tracking: 是否使用精细跟踪，默认 True
+
+        Returns:
+            优化后的预测结果字典，包含更新后的 extrinsic 和 intrinsic，如果 BA 失败则返回 None
+        """
+        if self.vggsfm_model_file_path is None:
+            print('[ERROR][Detector::optimizeCameraPosesByBA]')
+            print('\t please set vggsfm model file first!')
+            return None
+
+        if images.shape[0] == 0:
+            print('[ERROR][Detector::optimizeCameraPosesByBA]')
+            print('\t images are empty!')
+            return None
+
+        print("Starting Bundle Adjustment optimization...")
+
+        # 获取输入数据
+        images = toTensor(images, dtype=torch.float32, device=self.device)
+        extrinsic = predictions['extrinsic']  # (N, 3, 4)
+        intrinsic = predictions['intrinsic']  # (N, 3, 3)
+        depth_conf = predictions['depth_conf']  # (N, H, W)
+        points_3d = predictions['world_points_from_depth']  # (N, H, W, 3)
+
+        # 获取图像尺寸
+        image_size = np.array(images.shape[-2:])
+
+        # 设置数据类型
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+        # 预测轨迹
+        print("Predicting tracks for Bundle Adjustment...")
+        with torch.cuda.amp.autocast(dtype=dtype):
+            # 预测轨迹
+            pred_tracks, pred_vis_scores, pred_confs, points_3d_track, points_rgb = predict_tracks(
+                self.vggsfm_model_file_path,
+                images,
+                conf=depth_conf,
+                points_3d=points_3d,
+                masks=None,
+                max_query_pts=max_query_pts,
+                query_frame_num=query_frame_num,
+                keypoint_extractor="aliked+sp",
+                fine_tracking=fine_tracking,
+            )
+
+            torch.cuda.empty_cache()
+
+        # 构建轨迹掩码
+        track_mask = pred_vis_scores > vis_thresh
+
+        # 构建 COLMAP reconstruction 对象
+        print("Building COLMAP reconstruction...")
+        reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
+            points_3d_track,
+            extrinsic,
+            intrinsic,
+            pred_tracks,
+            image_size,
+            masks=track_mask,
+            max_reproj_error=max_reproj_error,
+            shared_camera=shared_camera,
+            camera_type=camera_type,
+            points_rgb=points_rgb,
+        )
+
+        if reconstruction is None:
+            print('[ERROR][Detector::optimizeCameraPosesByBA]')
+            print('\t No reconstruction can be built with BA')
+            return predictions
+
+        # 执行 Bundle Adjustment
+        print("Running Bundle Adjustment...")
+        ba_options = pycolmap.BundleAdjustmentOptions()
+        pycolmap.bundle_adjustment(reconstruction, ba_options)
+
+        # 从优化后的 reconstruction 中提取位姿
+        print("Extracting optimized poses from reconstruction...")
+        _, optimized_extrinsic_44, optimized_intrinsic, _ = pycolmap_to_batch_np_matrix(
+            reconstruction, device="cpu", camera_type=camera_type
+        )
+
+        # 将 4x4 矩阵转换为 3x4 矩阵（只取前 3 行）
+        if optimized_extrinsic_44.shape[-1] == 4 and optimized_extrinsic_44.shape[-2] == 4:
+            optimized_extrinsic = optimized_extrinsic_44[:, :3, :]  # (N, 3, 4)
+        else:
+            optimized_extrinsic = optimized_extrinsic_44
+
+        # 更新 predictions 字典
+        optimized_predictions = predictions.copy()
+        optimized_predictions['extrinsic'] = optimized_extrinsic
+        optimized_predictions['intrinsic'] = optimized_intrinsic
+
+        optimized_predictions['points_3d_ba'] = points_3d_track
+        optimized_predictions['colors_3d_ba'] = points_rgb
+
+        print("Bundle Adjustment optimization completed successfully!")
+        return optimized_predictions

@@ -6,10 +6,12 @@
 
 import torch
 import numpy as np
+from vggt.dependency import vggsfm_tracker
 from .vggsfm_utils import *
 
 
 def predict_tracks(
+    model_file_path: str,
     images,
     conf=None,
     points_3d=None,
@@ -53,7 +55,7 @@ def predict_tracks(
 
     device = images.device
     dtype = images.dtype
-    tracker = build_vggsfm_tracker().to(device, dtype)
+    tracker = build_vggsfm_tracker(model_file_path).to(device, dtype)
 
     # Find query frames
     query_frame_indexes = generate_rank_by_dino(images, query_frame_num=query_frame_num, device=device)

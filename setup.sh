@@ -4,7 +4,8 @@ git clone https://github.com/jytime/LightGlue.git
 
 pip install tqdm hydra-core omegaconf opencv-python \
   scipy onnxruntime requests matplotlib pillow \
-  huggingface_hub einops safetensors ninja plyfile evo
+  huggingface_hub einops safetensors ninja plyfile evo \
+  pyliblzfse
 
 pip install numpy==1.26.4
 pip install gradio==5.17.1

@@ -110,8 +110,11 @@ def demo_fn(args):
 
     # Run VGGT for camera and depth estimation
     model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    home = os.environ['HOME']
+    model_file_path = home + '/chLi/Model/VGGT/VGGT-1B/model.pt'
+    vggsfm_model_file_path = home + '/chLi/Model/VGGT/vggsfm_v2_tracker.pt'
+    model_state_dict = torch.load(model_file_path, map_location='cpu')
+    model.load_state_dict(model_state_dict)
     model.eval()
     model = model.to(device)
     print(f"Model loaded")
@@ -152,6 +155,7 @@ def demo_fn(args):
             # You can also change the pred_tracks to tracks from any other methods
             # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
             pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
+                vggsfm_model_file_path,
                 images,
                 conf=depth_conf,
                 points_3d=points_3d,
