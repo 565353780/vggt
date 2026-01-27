@@ -3,6 +3,7 @@ sys.path.append('../../MATCH/camera-control')
 
 import os
 
+from camera_control.Method.pcd import toPcd
 from camera_control.Module.camera_convertor import CameraConvertor
 from camera_control.Module.colmap_renderer import COLMAPRenderer
 
@@ -26,7 +27,7 @@ def demo():
         device,
     )
 
-    camera_list = detector.detectVideoFile(
+    result = detector.detectVideoFile(
         video_file_path,
         image_folder_path,
         robust_mode,
@@ -34,14 +35,13 @@ def demo():
         target_image_num=60,
     )
 
-    assert camera_list is not None
+    assert result is not None
+
+    camera_list, predictions = result
 
     print('camera num:', len(camera_list))
 
-    pcd = CameraConvertor.createDepthPcd(
-        camera_list,
-        conf_thresh=0.8,
-    )
+    pcd = toPcd(predictions['points_ba'], predictions['colors_ba'])
 
     save_colmap_folder_path = save_folder_path + 'colmap/'
     if not os.path.exists(save_colmap_folder_path):

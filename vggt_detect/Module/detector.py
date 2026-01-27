@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 from shutil import rmtree
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Tuple
 
 from camera_control.Method.data import toTensor
 from camera_control.Module.camera import Camera
@@ -261,8 +261,7 @@ class Detector(object):
         robust_mode: bool=True,
         cos_thresh: float=0.95,
         crop_bound_pixel_num: int=1,
-        return_dict: bool=False,
-    ) -> Optional[Union[List[Camera], Dict]]:
+    ) -> Optional[Tuple[List[Camera], Dict]]:
         '''
         image_bounds: torch.Tensor of shape (N, 4) containing [x1, y1, x2, y2] for each image,
                       indicating the pixel bounds of the original image content in the input tensor.
@@ -288,9 +287,6 @@ class Detector(object):
 
         if optimized_predictions is None:
             return None
-
-        if return_dict:
-            return optimized_predictions
 
         pred_images = optimized_predictions['images'] # N, 3, H, W
         depths = optimized_predictions['depth'] # N, H, W, 1
@@ -353,7 +349,7 @@ class Detector(object):
 
             camera_list.append(camera)
 
-        return camera_list
+        return camera_list, optimized_predictions
 
     @torch.no_grad()
     def detectImageFiles(
@@ -361,8 +357,7 @@ class Detector(object):
         image_file_path_list: list,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-        return_dict: bool=False,
-    ) -> Optional[Union[List[Camera], Dict]]:
+    ) -> Optional[Tuple[List[Camera], Dict]]:
         '''
         Args:
             image_file_path_list: List of image file paths
@@ -390,7 +385,6 @@ class Detector(object):
             image_bounds,
             robust_mode,
             cos_thresh,
-            return_dict=return_dict,
         )
 
     @torch.no_grad()
@@ -399,8 +393,7 @@ class Detector(object):
         image_folder_path: str,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-        return_dict: bool=False,
-    ) -> Optional[Union[List[Camera], Dict]]:
+    ) -> Optional[Tuple[List[Camera], Dict]]:
         '''
         Args:
             image_folder_path: Path to folder containing images
@@ -428,7 +421,6 @@ class Detector(object):
             image_file_path_list,
             robust_mode,
             cos_thresh,
-            return_dict,
         )
 
     @torch.no_grad()
@@ -438,9 +430,8 @@ class Detector(object):
         save_image_folder_path: str,
         robust_mode: bool=True,
         cos_thresh: float=0.95,
-        return_dict: bool=False,
         target_image_num: int=100,
-    ) -> Optional[Union[List[Camera], Dict]]:
+    ) -> Optional[Tuple[List[Camera], Dict]]:
         if not os.path.exists(video_file_path):
             print('[ERROR][Detector::detectVideoFile]')
             print('\t video file not exist!')
@@ -468,7 +459,6 @@ class Detector(object):
             save_image_folder_path,
             robust_mode=robust_mode,
             cos_thresh=cos_thresh,
-            return_dict=return_dict,
         )
 
     @torch.no_grad()
@@ -594,8 +584,8 @@ class Detector(object):
         optimized_predictions['extrinsic'] = optimized_extrinsic
         optimized_predictions['intrinsic'] = optimized_intrinsic
 
-        optimized_predictions['points_3d_ba'] = points_3d_track
-        optimized_predictions['colors_3d_ba'] = points_rgb
+        optimized_predictions['points_ba'] = points_3d_track
+        optimized_predictions['colors_ba'] = points_rgb
 
         print("Bundle Adjustment optimization completed successfully!")
         return optimized_predictions
